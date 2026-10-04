@@ -42,18 +42,17 @@ namespace ClawdDesktop
     {
         public string Kind;
         public float X, Y, Vx, Vy, T, Life, Size;
+        public Color Color;
     }
 
-    // 掉下来的饼干：一个独立的小透明窗口，鼠标可以穿透
-    class CookieForm : Form
+    // 小玩具窗口的公共部分：无边框、透明、置顶、不抢焦点
+    class ToyForm : Form
     {
-        public float X, Y, Vy, Floor;
-        public bool Landed;
-        readonly int u;
+        readonly bool clickThrough;
 
-        public CookieForm(int unit)
+        public ToyForm(int w, int h, bool passClicks)
         {
-            u = unit;
+            clickThrough = passClicks;
             FormBorderStyle = FormBorderStyle.None;
             ShowInTaskbar = false;
             TopMost = true;
@@ -61,7 +60,7 @@ namespace ClawdDesktop
             BackColor = PetForm.Key;
             TransparencyKey = PetForm.Key;
             DoubleBuffered = true;
-            Size = new Size(6 * u, 6 * u);
+            Size = new Size(w, h);
         }
 
         protected override bool ShowWithoutActivation { get { return true; } }
@@ -71,10 +70,22 @@ namespace ClawdDesktop
             get
             {
                 CreateParams cp = base.CreateParams;
-                cp.ExStyle |= 0x80 | 0x20; // WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT：鼠标穿透
+                cp.ExStyle |= 0x80;                    // WS_EX_TOOLWINDOW：不出现在 Alt+Tab 里
+                if (clickThrough) cp.ExStyle |= 0x20;  // WS_EX_TRANSPARENT：鼠标穿透
                 return cp;
             }
         }
+    }
+
+    // 掉下来的饼干，鼠标可以穿透
+    class CookieForm : ToyForm
+    {
+        public float X, Y, Vy, Floor;
+        public bool Landed;
+        public PetForm Claimer;   // 哪只 Clawd 正在吃
+        readonly int u;
+
+        public CookieForm(int unit) : base(6 * unit, 6 * unit, true) { u = unit; }
 
         public void Place()
         {
@@ -97,29 +108,171 @@ namespace ClawdDesktop
         }
     }
 
+    // 球：可以用鼠标拖着扔，Clawd 会追着踢
+    class BallForm : ToyForm
+    {
+        public float X, Y, Vx, Vy;   // X 是中心，Y 是底部
+        public bool Held;
+        public float KickCooldown;
+        public readonly int Radius;
+        readonly float s;
+        readonly Stopwatch sw = Stopwatch.StartNew();
+        Point last;
+        long lastMs;
+        float mvx, mvy;
+
+        public BallForm(int radius, float scale) : base(radius * 2, radius * 2, false)
+        {
+            Radius = radius;
+            s = scale;
+            Cursor = Cursors.Hand;
+        }
+
+        public void Place()
+        {
+            Location = new Point((int)Math.Round(X - Radius), (int)Math.Round(Y - 2 * Radius));
+        }
+
+        public Rectangle Area()
+        {
+            return Screen.FromPoint(new Point((int)X, (int)Y - 5)).WorkingArea;
+        }
+
+        public bool OnGround()
+        {
+            return !Held && Math.Abs(Y - Area().Bottom) < 2 && Math.Abs(Vy) < 1;
+        }
+
+        public void Step(float dt)
+        {
+            KickCooldown -= dt;
+            if (Held)
+            {
+                if (sw.ElapsedMilliseconds - lastMs > 80) { mvx = 0; mvy = 0; }
+                return;
+            }
+            Rectangle wa = Area();
+            Vy += 1800 * s * dt;
+            X += Vx * dt;
+            Y += Vy * dt;
+            if (Y >= wa.Bottom)
+            {
+                Y = wa.Bottom;
+                Vy = Vy > 150 * s ? -Vy * 0.55f : 0;
+                Vx *= (float)Math.Pow(0.35, dt);
+            }
+            if (Y < wa.Top + 2 * Radius) { Y = wa.Top + 2 * Radius; Vy = Math.Abs(Vy) * 0.5f; }
+            if (X < wa.Left + Radius) { X = wa.Left + Radius; Vx = Math.Abs(Vx) * 0.7f; }
+            if (X > wa.Right - Radius) { X = wa.Right - Radius; Vx = -Math.Abs(Vx) * 0.7f; }
+            if (Math.Abs(Vx) < 5 * s && Y >= wa.Bottom) Vx = 0;
+            Place();
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (e.Button != MouseButtons.Left) return;
+            Held = true;
+            last = Cursor.Position;
+            lastMs = sw.ElapsedMilliseconds;
+            mvx = 0; mvy = 0;
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            if (!Held) return;
+            Point c = Cursor.Position;
+            long ms = sw.ElapsedMilliseconds;
+            float dtm = Math.Max(1, ms - lastMs) / 1000f;
+            mvx = 0.6f * mvx + 0.4f * (c.X - last.X) / dtm;
+            mvy = 0.6f * mvy + 0.4f * (c.Y - last.Y) / dtm;
+            last = c;
+            lastMs = ms;
+            X = c.X;
+            Y = Math.Min(c.Y + Radius, Area().Bottom);
+            Place();
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            base.OnMouseUp(e);
+            if (e.Button != MouseButtons.Left) return;
+            Held = false;
+            Vx = Math.Max(-2000 * s, Math.Min(2000 * s, mvx));
+            Vy = Math.Max(-2000 * s, Math.Min(2000 * s, mvy));
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.None;
+            int d = Radius * 2 - 1;
+            using (GraphicsPath path = new GraphicsPath())
+            using (SolidBrush red = new SolidBrush(Color.FromArgb(0xE0, 0x4E, 0x4E)))
+            using (SolidBrush white = new SolidBrush(Color.FromArgb(0xFA, 0xF7, 0xF2)))
+            using (SolidBrush blue = new SolidBrush(Color.FromArgb(0x4E, 0x8B, 0xD9)))
+            {
+                path.AddEllipse(0, 0, d, d);
+                g.FillPath(red, path);
+                g.SetClip(path);
+                g.FillRectangle(white, 0, (int)(Radius * 0.75f), d + 1, (int)(Radius * 0.5f));
+                g.FillRectangle(blue, (int)(Radius * 0.8f), 0, (int)(Radius * 0.4f), d + 1);
+                g.ResetClip();
+            }
+        }
+    }
+
     public class PetForm : Form
     {
         public static readonly Color Key = Color.FromArgb(255, 0, 254);
-        static readonly Color BodyC = Color.FromArgb(0xD9, 0x77, 0x57);
-        static readonly Color LegC = Color.FromArgb(0xC4, 0x66, 0x4A);
         static readonly Color EyeC = Color.FromArgb(0x1B, 0x14, 0x11);
         static readonly Color HeartC = Color.FromArgb(0xE4, 0x6F, 0x8F);
         static readonly Color StarC = Color.FromArgb(0xE0, 0xA2, 0x4A);
+        static readonly Color AngerC = Color.FromArgb(0xE0, 0x3E, 0x3E);
         static readonly Color InkC = Color.FromArgb(0x2B, 0x2E, 0x35);
         static readonly Color ZC = Color.FromArgb(0x7A, 0x80, 0x8C);
+        static readonly Color TomatoC = Color.FromArgb(0xD9, 0x4A, 0x3D);
+        static readonly Color[] NoteColors = { Color.FromArgb(0x7B, 0x6C, 0xD9), Color.FromArgb(0x4E, 0x8B, 0xD9), Color.FromArgb(0xE4, 0x6F, 0x8F), Color.FromArgb(0x3F, 0xA7, 0x7A) };
+        static readonly Color ClawdOrange = Color.FromArgb(0xD9, 0x77, 0x57);
+        // 新来的 Clawd 的颜色
+        static readonly Color[] FriendColors = {
+            Color.FromArgb(0xE8, 0xA2, 0x5A), Color.FromArgb(0x7F, 0xA7, 0xD9), Color.FromArgb(0x8F, 0xBF, 0x7F),
+            Color.FromArgb(0xB4, 0x8E, 0xD6), Color.FromArgb(0xE8, 0x8F, 0xA8), Color.FromArgb(0xC9, 0x82, 0x6B)
+        };
+        static readonly string[] FriendNames = { "橘子", "蓝莓", "青提", "葡萄", "草莓", "可可" };
 
         const string ClaudeUrl = "https://claude.ai/new";
         const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
         const string RunName = "ClawdDesktopPet";
+        const int MaxPets = 7;
+        const int PomodoroMinutes = 25;
 
         static readonly string[] TapLines = { "嘿嘿～", "摸摸头！", "再摸一下嘛", "嗯？叫我吗", "今天也要加油哦" };
-        static readonly string[] IdleLines = { "git push 了吗？", "要不要喝口水", "我在看着你哦", "休息一下眼睛吧", "这个 bug 我好像见过…", "记得保存文件！", "右键我可以打开 Claude 哦" };
+        static readonly string[] IdleLines = { "git push 了吗？", "要不要喝口水", "我在看着你哦", "休息一下眼睛吧", "这个 bug 我好像见过…", "记得保存文件！", "右键我可以打开 Claude 哦", "要不要来个番茄钟？" };
         static readonly string[] HungryLines = { "肚子咕咕叫…", "有饼干吗…右键喂我", "饿饿" };
         static readonly string[] HeldLines = { "哇啊啊——", "放我下来！", "好高！" };
         static readonly string[] LandLines = { "晕…", "眼冒金星…", "下次轻点扔嘛" };
         static readonly string[] WakeLines = { "唔…我醒着呢", "没睡没睡", "刚才在思考" };
         static readonly string[] EatLines = { "好吃！", "嚼嚼嚼", "再来一块！" };
         static readonly string[] ComeLines = { "开饭啦！", "饼干！", "冲！" };
+        static readonly string[] AngryLines = { "别戳啦！", "哼！生气了！", "再戳我咬你哦", "戳戳戳，烦死啦" };
+        static readonly string[] KickLines = { "看我的！", "射门！", "嘿！", "接着！" };
+        static readonly string[] CatchLines = { "抓到你啦！", "嘿嘿，追上了", "鼠标别跑！" };
+
+        // 所有 Clawd 共享的东西
+        static readonly List<PetForm> pets = new List<PetForm>();
+        static readonly List<CookieForm> cookies = new List<CookieForm>();
+        static BallForm ball;
+        static bool chaseMouse;
+        static DateTime pomoEnd = DateTime.MinValue;
+        static bool pomoHalfSaid, pomoFiveSaid;
+        static readonly Random rnd = new Random();
+        static int friendIndex;
+
+        readonly bool isMain;
+        readonly string petName;
+        readonly Color bodyC, legC;
 
         readonly float S;   // DPI 缩放
         readonly int U;     // 一个像素格的大小
@@ -128,16 +281,15 @@ namespace ClawdDesktop
         float px, py, vx, vy;
         int dir = 1;
         string state = "idle";
-        float t, next = 2f, target, squash, blink, nextBlink = 2f, walkPhase, idleFor, chatIn = 20f;
+        float t, next = 2f, target, walkSpeed = 55, squash, blink, nextBlink = 2f, walkPhase, idleFor, chatIn = 20f, noteIn;
         CookieForm eating;
-        readonly List<CookieForm> cookies = new List<CookieForm>();
         readonly List<Particle> parts = new List<Particle>();
+        readonly List<long> pokes = new List<long>();
         string bubbleText;
         float bubbleTime;
         float food = 70f, mood = 70f, saveIn = 30f;
         bool pinned;      // 定住：拖到哪儿就待在哪儿
         float pinY;
-        readonly Random rnd = new Random();
 
         readonly System.Windows.Forms.Timer timer;
         readonly Stopwatch sw = Stopwatch.StartNew();
@@ -150,13 +302,16 @@ namespace ClawdDesktop
 
         readonly NotifyIcon tray;
         readonly ContextMenuStrip menu;
-        ToolStripMenuItem statItem, sleepItem, autoItem, pinItem;
+        ToolStripMenuItem statItem, sleepItem, autoItem, pinItem, chaseItem, ballItem, pomoItem, friendItem;
         readonly string launcherPath, savePath;
-        readonly Font bubbleFont, zFont;
+        readonly Font bubbleFont, zFont, timerFont;
 
-        public PetForm(string launcher)
+        public PetForm(string launcher) : this(launcher, null) { }
+
+        PetForm(string launcher, PetForm parent)
         {
             launcherPath = launcher;
+            isMain = parent == null;
             FormBorderStyle = FormBorderStyle.None;
             ShowInTaskbar = false;
             TopMost = true;
@@ -174,48 +329,71 @@ namespace ClawdDesktop
 
             bubbleFont = new Font("Microsoft YaHei UI", 9.5f);
             zFont = new Font("Consolas", 11f, FontStyle.Bold);
+            timerFont = new Font("Consolas", 8.5f, FontStyle.Bold);
 
             string dirPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "ClawdPet");
             savePath = Path.Combine(dirPath, "state.txt");
-            LoadState();
 
             Rectangle wa = Screen.PrimaryScreen.WorkingArea;
-            bool onScreen = false;
-            if (pinned)
-                foreach (Screen sc in Screen.AllScreens)
-                    if (sc.WorkingArea.Contains((int)px, (int)pinY - 10)) onScreen = true;
-            if (onScreen) py = pinY;
+            if (isMain)
+            {
+                petName = "Clawd";
+                bodyC = ClawdOrange;
+                LoadState();
+                bool onScreen = false;
+                if (pinned)
+                    foreach (Screen sc in Screen.AllScreens)
+                        if (sc.WorkingArea.Contains((int)px, (int)pinY - 10)) onScreen = true;
+                if (onScreen) py = pinY;
+                else
+                {
+                    pinned = false;
+                    px = wa.Right - 220 * S;
+                    py = wa.Bottom;
+                }
+            }
             else
             {
-                pinned = false;
-                px = wa.Right - 220 * S;
-                py = wa.Bottom;
+                int i = friendIndex++ % FriendColors.Length;
+                petName = FriendNames[i];
+                bodyC = FriendColors[i];
+                food = parent.food;
+                mood = parent.mood;
+                px = Clamp(parent.px + R(-400, 400) * S, wa.Left + 60 * S, wa.Right - 60 * S);
+                py = wa.Top + 60 * S;
+                state = "fall";
             }
+            legC = Darker(bodyC, 0.88f);
             target = px;
 
             menu = BuildMenu();
             ContextMenuStrip = menu;
 
-            tray = new NotifyIcon();
-            tray.Icon = MakeIcon();
-            tray.Text = "Clawd 桌宠";
-            tray.ContextMenuStrip = menu;
-            tray.Visible = true;
-            tray.MouseClick += delegate(object s, MouseEventArgs e)
+            if (isMain)
             {
-                if (e.Button != MouseButtons.Left) return;
-                ComeHome();
-            };
+                tray = new NotifyIcon();
+                tray.Icon = MakeIcon();
+                tray.Text = "Clawd 桌宠";
+                tray.ContextMenuStrip = menu;
+                tray.Visible = true;
+                tray.MouseClick += delegate(object s, MouseEventArgs e)
+                {
+                    if (e.Button != MouseButtons.Left) return;
+                    ComeHome();
+                };
+            }
 
             timer = new System.Windows.Forms.Timer();
             timer.Interval = 15;
             timer.Tick += delegate { Tick(); };
 
+            pets.Add(this);
             Load += delegate
             {
                 Place();
                 timer.Start();
-                Say("嗨！我是 Clawd～右键我有菜单哦", 4f);
+                if (isMain) Say("嗨！我是 Clawd～右键我有菜单哦", 4f);
+                else Say("我是" + petName + "，我也来啦！", 3f);
             };
         }
 
@@ -232,9 +410,11 @@ namespace ClawdDesktop
         }
 
         // ---------- 工具 ----------
-        float R(float a, float b) { return a + (float)rnd.NextDouble() * (b - a); }
-        string Pick(string[] arr) { return arr[rnd.Next(arr.Length)]; }
+        static float R(float a, float b) { return a + (float)rnd.NextDouble() * (b - a); }
+        static string Pick(string[] arr) { return arr[rnd.Next(arr.Length)]; }
         static float Clamp(float v, float a, float b) { return Math.Max(a, Math.Min(b, v)); }
+        static Color Darker(Color c, float k) { return Color.FromArgb((int)(c.R * k), (int)(c.G * k), (int)(c.B * k)); }
+        static bool PomoActive { get { return pomoEnd > DateTime.Now; } }
 
         Rectangle Area()
         {
@@ -263,7 +443,14 @@ namespace ClawdDesktop
 
         bool InAir() { return state == "held" || state == "fall" || state == "jump"; }
 
-        // ---------- 存档 ----------
+        void WalkTo(float x, float speed)
+        {
+            target = x;
+            walkSpeed = speed;
+            if (state != "walk") SetState("walk", 0);
+        }
+
+        // ---------- 存档（只存主 Clawd） ----------
         void LoadState()
         {
             try
@@ -288,6 +475,7 @@ namespace ClawdDesktop
 
         void SaveState()
         {
+            if (!isMain) return;
             try
             {
                 Directory.CreateDirectory(Path.GetDirectoryName(savePath));
@@ -297,11 +485,11 @@ namespace ClawdDesktop
         }
 
         // ---------- 菜单 ----------
-        ToolStripMenuItem AddItem(ContextMenuStrip m, string text, Action act)
+        static ToolStripMenuItem AddItem(ToolStripItemCollection items, string text, Action act)
         {
             ToolStripMenuItem it = new ToolStripMenuItem(text);
             it.Click += delegate { act(); };
-            m.Items.Add(it);
+            items.Add(it);
             return it;
         }
 
@@ -312,25 +500,49 @@ namespace ClawdDesktop
             statItem.Enabled = false;
             m.Items.Add(statItem);
             m.Items.Add(new ToolStripSeparator());
-            AddItem(m, "喂饼干", Feed);
-            AddItem(m, "摸摸头", PetHead);
-            AddItem(m, "跳一下", Jump);
-            sleepItem = AddItem(m, "睡觉", ToggleSleep);
-            pinItem = AddItem(m, "定在这里", TogglePin);
+            AddItem(m.Items, "喂饼干", Feed);
+            AddItem(m.Items, "摸摸头", PetHead);
+            AddItem(m.Items, "跳一下", Jump);
+            sleepItem = AddItem(m.Items, "睡觉", ToggleSleep);
+            pinItem = AddItem(m.Items, "定在这里", TogglePin);
+
+            ToolStripMenuItem play = new ToolStripMenuItem("一起玩");
+            m.Items.Add(play);
+            AddItem(play.DropDownItems, "跳舞", DanceAll);
+            ballItem = AddItem(play.DropDownItems, "扔个球", ToggleBall);
+            chaseItem = AddItem(play.DropDownItems, "追鼠标", ToggleChase);
+            friendItem = AddItem(play.DropDownItems, "再来一只 Clawd", AddFriend);
+            pomoItem = AddItem(m.Items, "番茄钟（25 分钟）", TogglePomodoro);
+
             m.Items.Add(new ToolStripSeparator());
-            ToolStripMenuItem claude = AddItem(m, "打开 Claude", OpenClaude);
+            ToolStripMenuItem claude = AddItem(m.Items, "打开 Claude", OpenClaude);
             claude.Font = new Font(claude.Font, FontStyle.Bold);
             m.Items.Add(new ToolStripSeparator());
-            AddItem(m, "叫它回来", ComeHome);
-            autoItem = AddItem(m, "开机自动启动", ToggleAutoStart);
-            AddItem(m, "退出", Quit);
+            if (isMain)
+            {
+                AddItem(m.Items, "叫它回来", ComeHome);
+                autoItem = AddItem(m.Items, "开机自动启动", ToggleAutoStart);
+                AddItem(m.Items, "退出", Quit);
+            }
+            else AddItem(m.Items, "让" + petName + "回家", Close);
+
             m.Opening += delegate
             {
-                statItem.Text = string.Format("Clawd · 饱腹 {0:0} · 心情 {1:0}", food, mood);
+                statItem.Text = string.Format("{0} · 饱腹 {1:0} · 心情 {2:0}", petName, food, mood);
                 sleepItem.Text = state == "sleep" ? "叫醒它" : "睡觉";
                 pinItem.Checked = pinned;
-                autoItem.Checked = AutoStartOn();
-                autoItem.Enabled = !string.IsNullOrEmpty(launcherPath);
+                chaseItem.Checked = chaseMouse;
+                ballItem.Text = ball != null ? "收起球" : "扔个球";
+                friendItem.Enabled = pets.Count < MaxPets;
+                if (PomoActive)
+                    pomoItem.Text = string.Format("停止番茄钟（还剩 {0} 分钟）", (int)Math.Ceiling((pomoEnd - DateTime.Now).TotalMinutes));
+                else
+                    pomoItem.Text = "番茄钟（25 分钟）";
+                if (autoItem != null)
+                {
+                    autoItem.Checked = AutoStartOn();
+                    autoItem.Enabled = !string.IsNullOrEmpty(launcherPath);
+                }
             };
             return m;
         }
@@ -341,13 +553,37 @@ namespace ClawdDesktop
             Touch();
             if (state == "sleep") { SetState("idle", R(1.5f, 3f)); Say(Pick(WakeLines), 2.4f); return; }
             if (InAir()) return;
+            if (state == "angry") { Say("哼！", 1.2f); return; }
             mood = Clamp(mood + 8, 0, 100);
             SetState("happy", 1.3f);
             Hearts(4);
             Say(Pick(TapLines), 2.4f);
         }
 
+        // 鼠标点它：戳太多会生气
+        void Poke()
+        {
+            long now = sw.ElapsedMilliseconds;
+            pokes.Add(now);
+            pokes.RemoveAll(delegate(long p) { return now - p > 2000; });
+            if (pokes.Count >= 5 && state != "sleep" && !InAir())
+            {
+                pokes.Clear();
+                Touch();
+                mood = Clamp(mood - 3, 0, 100);
+                SetState("angry", 2.4f);
+                Say(Pick(AngryLines), 2.4f);
+                return;
+            }
+            PetHead();
+        }
+
         void Feed()
+        {
+            foreach (PetForm p in pets.ToArray()) p.DropCookie();
+        }
+
+        void DropCookie()
         {
             Touch();
             Rectangle wa = Area();
@@ -393,6 +629,70 @@ namespace ClawdDesktop
             }
             else Say("自由啦～", 2f);
             SaveState();
+        }
+
+        void StartDance()
+        {
+            Touch();
+            if (InAir() || state == "eat") return;
+            SetState("dance", 6f);
+            noteIn = 0;
+            Say(pets.Count > 1 ? "一起跳！" : "动次打次～", 2f);
+        }
+
+        void DanceAll()
+        {
+            foreach (PetForm p in pets.ToArray()) p.StartDance();
+        }
+
+        void ToggleBall()
+        {
+            Touch();
+            if (ball != null)
+            {
+                ball.Close();
+                ball = null;
+                Say("球收起来啦", 1.6f);
+                return;
+            }
+            Rectangle wa = Area();
+            ball = new BallForm(Math.Max(8, (int)Math.Round(9 * S)), S);
+            ball.X = Clamp(px + R(-250, 250) * S, wa.Left + 40 * S, wa.Right - 40 * S);
+            ball.Y = wa.Top + 40 * S;
+            ball.Vx = R(-200, 200) * S;
+            ball.Place();
+            ball.Show();
+            Say("球！我要踢！（球可以拖着扔）", 2.6f);
+        }
+
+        void ToggleChase()
+        {
+            Touch();
+            chaseMouse = !chaseMouse;
+            Say(chaseMouse ? "鼠标别跑！我来啦！" : "不追啦，休息一下", 2f);
+        }
+
+        void AddFriend()
+        {
+            if (pets.Count >= MaxPets) return;
+            PetForm f = new PetForm(launcherPath, this);
+            f.Show();
+            Say("有新朋友啦！", 2f);
+        }
+
+        void TogglePomodoro()
+        {
+            Touch();
+            if (PomoActive)
+            {
+                pomoEnd = DateTime.MinValue;
+                Say("番茄钟停了，休息一下吧", 2.4f);
+                return;
+            }
+            pomoEnd = DateTime.Now.AddMinutes(PomodoroMinutes);
+            pomoHalfSaid = false;
+            pomoFiveSaid = false;
+            Say("开始专注！" + PomodoroMinutes + " 分钟后叫你，我不吵你", 3.5f);
         }
 
         void OpenClaude()
@@ -450,14 +750,24 @@ namespace ClawdDesktop
         protected override void OnFormClosed(FormClosedEventArgs e)
         {
             timer.Stop();
-            SaveState();
-            tray.Visible = false;
-            tray.Dispose();
-            foreach (CookieForm c in cookies) c.Close();
+            pets.Remove(this);
+            foreach (CookieForm c in cookies) if (c.Claimer == this) c.Claimer = null;
+            if (isMain)
+            {
+                SaveState();
+                tray.Visible = false;
+                tray.Dispose();
+                foreach (CookieForm c in cookies.ToArray()) c.Close();
+                if (ball != null) ball.Close();
+                foreach (PetForm p in pets.ToArray()) p.Close();
+                base.OnFormClosed(e);
+                Application.Exit();
+                return;
+            }
             base.OnFormClosed(e);
-            Application.Exit();
         }
 
+        // ---------- 粒子 ----------
         void Hearts(int n)
         {
             for (int i = 0; i < n; i++)
@@ -485,6 +795,17 @@ namespace ClawdDesktop
             }
         }
 
+        void Note()
+        {
+            Particle p = new Particle();
+            p.Kind = "note";
+            p.X = R(-50, 50) * S; p.Y = -10 * U;
+            p.Vx = R(-15, 15) * S; p.Vy = R(-45, -30) * S;
+            p.Life = 1.6f;
+            p.Color = NoteColors[rnd.Next(NoteColors.Length)];
+            parts.Add(p);
+        }
+
         CookieForm NearestCookie()
         {
             CookieForm best = null;
@@ -492,6 +813,7 @@ namespace ClawdDesktop
             foreach (CookieForm c in cookies)
             {
                 if (!c.Landed || Math.Abs(c.Floor - py) > 4) continue;
+                if (c.Claimer != null && c.Claimer != this) continue;
                 float dd = Math.Abs(c.X - px);
                 if (dd < d) { d = dd; best = c; }
             }
@@ -523,9 +845,38 @@ namespace ClawdDesktop
                 if (now - lastMouseMs > 80) { mvx = 0; mvy = 0; }
             }
 
+            if (isMain) StepShared(dt);
             Step(dt);
             Place();
             Invalidate();
+        }
+
+        // 饼干、球、番茄钟只由主 Clawd 更新一次
+        void StepShared(float dt)
+        {
+            foreach (CookieForm c in cookies)
+            {
+                if (c.Landed) continue;
+                c.Vy += 1600 * S * dt;
+                c.Y += c.Vy * dt;
+                if (c.Y >= c.Floor) { c.Y = c.Floor; c.Landed = true; }
+                c.Place();
+            }
+            if (ball != null) ball.Step(dt);
+
+            if (pomoEnd != DateTime.MinValue)
+            {
+                double left = (pomoEnd - DateTime.Now).TotalMinutes;
+                if (left <= 0)
+                {
+                    pomoEnd = DateTime.MinValue;
+                    DanceAll();
+                    Hearts(6);
+                    Say("番茄钟到啦！起来活动一下吧～", 8f);
+                }
+                else if (left <= 5 && !pomoFiveSaid) { pomoFiveSaid = true; Say("还有 5 分钟，冲刺！", 3f); }
+                else if (left <= PomodoroMinutes / 2.0 && !pomoHalfSaid) { pomoHalfSaid = true; Say("过半啦，加油！", 3f); }
+            }
         }
 
         void Step(float dt)
@@ -543,16 +894,6 @@ namespace ClawdDesktop
             float floor = pinned ? pinY : wa.Bottom;
             float minX = wa.Left + 50 * S, maxX = wa.Right - 50 * S;
 
-            // 饼干下落
-            foreach (CookieForm c in cookies)
-            {
-                if (c.Landed) continue;
-                c.Vy += 1600 * S * dt;
-                c.Y += c.Vy * dt;
-                if (c.Y >= c.Floor) { c.Y = c.Floor; c.Landed = true; }
-                c.Place();
-            }
-
             // 屏幕或任务栏变了：站不住就掉下去
             if (!InAir())
             {
@@ -560,7 +901,7 @@ namespace ClawdDesktop
                 else if (py > floor) py = floor;
             }
 
-            bool busy = InAir() || state == "eat" || state == "sleep" || state == "dizzy";
+            bool busy = InAir() || state == "eat" || state == "sleep" || state == "dizzy" || state == "dance" || state == "angry";
             if (!busy)
             {
                 CookieForm f = NearestCookie();
@@ -569,19 +910,21 @@ namespace ClawdDesktop
                     if (Math.Abs(f.X - px) < 10 * S)
                     {
                         eating = f;
+                        f.Claimer = this;
                         SetState("eat", 1.4f);
                         Say(Pick(EatLines), 1.4f);
                     }
                     else if (state != "walk" || target != f.X)
                     {
                         if (state != "walk") Say(Pick(ComeLines), 1.2f);
-                        target = f.X;
-                        SetState("walk", 0);
+                        WalkTo(f.X, 75 * S);
                     }
                 }
+                else if (ball != null && !pinned && state != "happy") ChaseBall(floor, minX, maxX);
+                else if (chaseMouse && !pinned && (state == "idle" || state == "walk")) ChaseMouse(minX, maxX);
             }
 
-            if (state == "idle" || state == "walk")
+            if ((state == "idle" || state == "walk") && !PomoActive)
             {
                 chatIn -= dt;
                 if (chatIn <= 0) { Say(ChatLine(), 3.5f); chatIn = R(30, 80); }
@@ -592,12 +935,9 @@ namespace ClawdDesktop
                 case "idle":
                     if (t > next)
                     {
-                        if (idleFor > 180) { SetState("sleep", R(90, 240)); break; }
-                        if (!pinned && rnd.NextDouble() < 0.5)
-                        {
-                            target = Clamp(px + R(-350, 350) * S, minX, maxX);
-                            SetState("walk", 0);
-                        }
+                        if (idleFor > 180 && ball == null && !chaseMouse) { SetState("sleep", R(90, 240)); break; }
+                        if (!pinned && ball == null && !chaseMouse && rnd.NextDouble() < 0.5)
+                            WalkTo(Clamp(px + R(-350, 350) * S, minX, maxX), 55 * S);
                         else SetState("idle", R(3, 7));
                     }
                     break;
@@ -606,10 +946,9 @@ namespace ClawdDesktop
                 {
                     float dx = target - px;
                     if (dx != 0) dir = Math.Sign(dx);
-                    float sp = 55 * S;
-                    walkPhase += dt * 7;
-                    if (Math.Abs(dx) <= sp * dt) { px = target; SetState("idle", R(2, 6)); }
-                    else px += dir * sp * dt;
+                    walkPhase += dt * (walkSpeed > 80 * S ? 11 : 7);
+                    if (Math.Abs(dx) <= walkSpeed * dt) { px = target; SetState("idle", R(2, 6)); }
+                    else px += dir * walkSpeed * dt;
                     break;
                 }
 
@@ -645,6 +984,22 @@ namespace ClawdDesktop
                         Hearts(2);
                         SetState("idle", R(1, 2));
                     }
+                    break;
+
+                case "dance":
+                    dir = ((int)Math.Floor(t * 4) % 2 == 0) ? 1 : -1;
+                    noteIn -= dt;
+                    if (noteIn <= 0) { Note(); noteIn = 0.35f; }
+                    if (t > next)
+                    {
+                        mood = Clamp(mood + 5, 0, 100);
+                        SetState("idle", R(1, 2));
+                        Say(rnd.Next(2) == 0 ? "还想跳！" : "累了累了", 1.8f);
+                    }
+                    break;
+
+                case "angry":
+                    if (t > next) { SetState("idle", R(1, 2)); Say("…算了，原谅你了", 2f); }
                     break;
 
                 case "dizzy":
@@ -685,6 +1040,43 @@ namespace ClawdDesktop
             if (saveIn <= 0) { SaveState(); saveIn = 30; }
         }
 
+        void ChaseBall(float floor, float minX, float maxX)
+        {
+            if (ball.Held || Math.Abs(ball.Y - floor) > 70 * S)
+            {
+                // 球在天上或者在你手里：站着看
+                if (state == "walk") SetState("idle", 0.5f);
+                return;
+            }
+            float reach = 6 * U + ball.Radius;
+            if (Math.Abs(ball.X - px) < reach)
+            {
+                if (ball.KickCooldown > 0) return;
+                int kd = ball.X >= px ? 1 : -1;
+                if (Math.Abs(ball.X - px) < 2 * S) kd = rnd.Next(2) == 0 ? 1 : -1;
+                ball.Vx = kd * R(450, 950) * S;
+                ball.Vy = -R(350, 800) * S;
+                ball.Y -= 2;
+                ball.KickCooldown = 0.6f;
+                dir = kd;
+                mood = Clamp(mood + 1, 0, 100);
+                SetState("happy", 0.6f);
+                if (rnd.NextDouble() < 0.35) Say(Pick(KickLines), 1.2f);
+            }
+            else WalkTo(Clamp(ball.X, minX, maxX), 105 * S);
+        }
+
+        void ChaseMouse(float minX, float maxX)
+        {
+            float tx = Clamp(Cursor.Position.X, minX, maxX);
+            if (Math.Abs(tx - px) > 30 * S) WalkTo(tx, 110 * S);
+            else if (state == "walk")
+            {
+                SetState("idle", 1f);
+                if (rnd.NextDouble() < 0.3) Say(Pick(CatchLines), 1.4f);
+            }
+        }
+
         // ---------- 鼠标 ----------
         protected override void OnMouseDown(MouseEventArgs e)
         {
@@ -712,7 +1104,7 @@ namespace ClawdDesktop
                 {
                     dragging = true;
                     Touch();
-                    if (eating != null) eating = null;
+                    if (eating != null) { eating.Claimer = null; eating = null; }
                     SetState("held", 0);
                     Say(Pick(HeldLines), 1.6f);
                 }
@@ -746,7 +1138,7 @@ namespace ClawdDesktop
                 vy = Clamp(mvy, -1400 * S, 1800 * S);
                 SetState("fall", 0);
             }
-            else if (down) PetHead();
+            else if (down) Poke();
             down = false;
             dragging = false;
         }
@@ -758,12 +1150,12 @@ namespace ClawdDesktop
         }
 
         // 以脚底中心为原点画 Clawd
-        static void DrawSprite(Graphics g, float u, string s, int dir, int step, float t, bool blinking, float bob)
+        static void DrawSprite(Graphics g, float u, Color bodyColor, Color legColor, string s, int look, int step, float t, bool blinking, float bob)
         {
             bool walking = s == "walk";
             bool sleeping = s == "sleep";
-            using (SolidBrush body = new SolidBrush(BodyC))
-            using (SolidBrush leg = new SolidBrush(LegC))
+            using (SolidBrush body = new SolidBrush(bodyColor))
+            using (SolidBrush leg = new SolidBrush(legColor))
             using (SolidBrush eye = new SolidBrush(EyeC))
             {
                 int[] legCols = { -5, -3, 2, 4 };
@@ -771,6 +1163,7 @@ namespace ClawdDesktop
                 {
                     float h = 2 * u;
                     if (walking && (i % 2) == step) h = u;
+                    if (s == "dance" && (i % 2) == step) h = u * 1.4f;
                     if (s == "held") h = 2 * u + (i % 2 == 1 ? 2 : 0);
                     if (sleeping) h = u * 0.8f;
                     Px(g, leg, legCols[i] * u, -h, u, h);
@@ -787,11 +1180,17 @@ namespace ClawdDesktop
                     lA = up ? -u : 0;
                     rA = up ? 0 : -u;
                 }
+                if (s == "dance")
+                {
+                    bool up = Math.Sin(t * Math.PI * 4) > 0;
+                    lA = up ? -2 * u : 0;
+                    rA = up ? 0 : -2 * u;
+                }
+                if (s == "angry") { lA = rA = -u * 0.5f; }
                 if (s == "eat") { lA = rA = Math.Sin(t * 14) > 0 ? -u : 0; }
                 Px(g, body, -7 * u, top + 3 * u + lA, u, 2 * u);
                 Px(g, body, 6 * u, top + 3 * u + rA, u, 2 * u);
 
-                int look = (walking || s == "eat") ? dir : 0;
                 int[] eyes = { -4 + look, 3 + look };
                 float eyeTop = top + 2 * u;
                 for (int i = 0; i < 2; i++)
@@ -804,6 +1203,21 @@ namespace ClawdDesktop
                         Px(g, eye, ex, eyeTop + u * 0.5f, u, u * 0.5f);
                         Px(g, eye, ex + u, eyeTop + u, u * 0.5f, u * 0.5f);
                     }
+                    else if (s == "angry")
+                    {
+                        // 眼睛压扁 + 往中间斜的眉毛
+                        Px(g, eye, ex, eyeTop + 0.75f * u, u, 1.25f * u);
+                        if (i == 0)
+                        {
+                            Px(g, eye, ex - 0.5f * u, eyeTop - 0.5f * u, 0.75f * u, 0.5f * u);
+                            Px(g, eye, ex + 0.25f * u, eyeTop, 0.75f * u, 0.5f * u);
+                        }
+                        else
+                        {
+                            Px(g, eye, ex, eyeTop, 0.75f * u, 0.5f * u);
+                            Px(g, eye, ex + 0.75f * u, eyeTop - 0.5f * u, 0.75f * u, 0.5f * u);
+                        }
+                    }
                     else if (s == "dizzy")
                     {
                         bool up = ((int)Math.Floor(t * 6) + i) % 2 == 1;
@@ -814,6 +1228,7 @@ namespace ClawdDesktop
                 }
                 if (s == "eat" && Math.Sin(t * 14) > 0) Px(g, eye, -u, top + 5 * u, 2 * u, u);
                 if (s == "held") Px(g, eye, -u * 0.5f, top + 5 * u, u, u);
+                if (s == "dance") Px(g, eye, -u * 0.5f, top + 5 * u, u, u * 0.5f);
             }
         }
 
@@ -829,6 +1244,38 @@ namespace ClawdDesktop
             }
         }
 
+        static void DrawNote(Graphics g, float x, float y, float u, Color c)
+        {
+            using (SolidBrush b = new SolidBrush(c))
+            {
+                Px(g, b, x + 2 * u, y, u, 4 * u);       // 竖线
+                Px(g, b, x + 2 * u, y, 2.5f * u, u);    // 小旗
+                Px(g, b, x, y + 3.5f * u, 3 * u, 2 * u); // 音符头
+            }
+        }
+
+        // 生气时头上的「井」字
+        static void DrawAnger(Graphics g, float x, float y, float u)
+        {
+            using (SolidBrush b = new SolidBrush(AngerC))
+            {
+                Px(g, b, x, y + u, u, 2 * u); Px(g, b, x + u, y, 2 * u, u);
+                Px(g, b, x + 4 * u, y, 2 * u, u); Px(g, b, x + 6 * u, y + u, u, 2 * u);
+                Px(g, b, x, y + 4 * u, u, 2 * u); Px(g, b, x + u, y + 6 * u, 2 * u, u);
+                Px(g, b, x + 4 * u, y + 6 * u, 2 * u, u); Px(g, b, x + 6 * u, y + 4 * u, u, 2 * u);
+            }
+        }
+
+        int LookDir()
+        {
+            if (state == "walk" || state == "eat" || state == "dance") return dir;
+            if (state == "sleep") return 0;
+            float lookX = Cursor.Position.X;
+            if (ball != null && (state == "idle" || state == "happy")) lookX = ball.X;
+            float dx = lookX - px;
+            return dx < -40 * S ? -1 : (dx > 40 * S ? 1 : 0);
+        }
+
         protected override void OnPaint(PaintEventArgs e)
         {
             Graphics g = e.Graphics;
@@ -836,22 +1283,29 @@ namespace ClawdDesktop
             g.InterpolationMode = InterpolationMode.NearestNeighbor;
 
             float ax = FW / 2f, ay = FH - 2 * S;
-            float hop = state == "happy" ? (float)Math.Abs(Math.Sin(t * 9)) * 8 * S : 0;
-            int step = (int)Math.Floor(walkPhase) % 2;
+            float hop = 0;
+            if (state == "happy") hop = (float)Math.Abs(Math.Sin(t * 9)) * 8 * S;
+            if (state == "dance") hop = (float)Math.Abs(Math.Sin(t * Math.PI * 4)) * 12 * S;
+            float shake = state == "angry" ? (float)Math.Sin(t * 45) * 1.5f * S : 0;
+            int step = state == "dance" ? (int)Math.Floor(t * 4) % 2 : (int)Math.Floor(walkPhase) % 2;
             float bob = state == "walk" ? (step == 1 ? -U * 0.5f : 0) : (state == "sleep" ? (float)Math.Sin(t * 2) * 1.5f * S : 0);
 
             GraphicsState gs = g.Save();
-            g.TranslateTransform(ax, ay - hop);
+            g.TranslateTransform(ax + shake, ay - hop);
             g.ScaleTransform(1 + squash * 0.6f, 1 - squash);
             if (state == "held") g.RotateTransform((float)Math.Sin(t * 8) * 7);
-            DrawSprite(g, U, state, dir, step, t, blink > 0, bob);
+            if (state == "dance") g.RotateTransform((float)Math.Sin(t * Math.PI * 2) * 6);
+            DrawSprite(g, U, bodyC, legC, state, LookDir(), step, t, blink > 0, bob);
             g.Restore(gs);
+
+            if (state == "angry") DrawAnger(g, ax + 5 * U, ay - 12 * U, Math.Max(1, (float)Math.Round(1.5f * S)));
 
             // 粒子：坐标相对脚底
             foreach (Particle q in parts)
             {
                 float x = ax + q.X, y = ay + q.Y;
                 if (q.Kind == "heart") DrawHeart(g, x, y, 2.5f * S);
+                else if (q.Kind == "note") DrawNote(g, x, y, 2.5f * S, q.Color);
                 else if (q.Kind == "star")
                 {
                     using (SolidBrush b = new SolidBrush(StarC)) Px(g, b, x - 2 * S, y - 2 * S, 4 * S, 4 * S);
@@ -865,7 +1319,27 @@ namespace ClawdDesktop
                 }
             }
 
-            if (bubbleTime > 0 && !string.IsNullOrEmpty(bubbleText)) DrawBubble(g, ax, ay - 9 * U - hop - 12 * S);
+            float headTop = ay - 9 * U - hop - 12 * S;
+            if (bubbleTime > 0 && !string.IsNullOrEmpty(bubbleText)) DrawBubble(g, ax, headTop);
+            else if (isMain && PomoActive) DrawPomodoro(g, ax, headTop);
+        }
+
+        void DrawPomodoro(Graphics g, float cx, float bottom)
+        {
+            TimeSpan left = pomoEnd - DateTime.Now;
+            string text = string.Format("{0:00}:{1:00}", (int)left.TotalMinutes, left.Seconds);
+            g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+            SizeF sz = g.MeasureString(text, timerFont);
+            float w = (float)Math.Ceiling(sz.Width + 8 * S), h = (float)Math.Ceiling(sz.Height + 2 * S);
+            float x = cx - w / 2, y = bottom - h;
+            using (SolidBrush bg = new SolidBrush(TomatoC))
+            using (SolidBrush leaf = new SolidBrush(Color.FromArgb(0x3F, 0xA7, 0x5A)))
+            using (SolidBrush fg = new SolidBrush(Color.White))
+            {
+                Px(g, bg, x, y, w, h);
+                Px(g, leaf, cx - 3 * S, y - 3 * S, 6 * S, 3 * S);
+                g.DrawString(text, timerFont, fg, x + 4 * S, y + 1 * S);
+            }
         }
 
         void DrawBubble(Graphics g, float cx, float bottom)
@@ -904,7 +1378,7 @@ namespace ClawdDesktop
                     g.Clear(Color.Transparent);
                     g.SmoothingMode = SmoothingMode.None;
                     g.TranslateTransform(16, 27);
-                    DrawSprite(g, 2.3f, "idle", 0, 0, 0, false, 0);
+                    DrawSprite(g, 2.3f, ClawdOrange, Darker(ClawdOrange, 0.88f), "idle", 0, 0, 0, false, 0);
                 }
                 return Icon.FromHandle(bmp.GetHicon());
             }
