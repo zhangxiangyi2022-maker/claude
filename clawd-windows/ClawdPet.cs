@@ -135,6 +135,8 @@ namespace ClawdDesktop
         string bubbleText;
         float bubbleTime;
         float food = 70f, mood = 70f, saveIn = 30f;
+        bool pinned;      // 定住：拖到哪儿就待在哪儿
+        float pinY;
         readonly Random rnd = new Random();
 
         readonly System.Windows.Forms.Timer timer;
@@ -148,7 +150,7 @@ namespace ClawdDesktop
 
         readonly NotifyIcon tray;
         readonly ContextMenuStrip menu;
-        ToolStripMenuItem statItem, sleepItem, autoItem;
+        ToolStripMenuItem statItem, sleepItem, autoItem, pinItem;
         readonly string launcherPath, savePath;
         readonly Font bubbleFont, zFont;
 
@@ -178,8 +180,17 @@ namespace ClawdDesktop
             LoadState();
 
             Rectangle wa = Screen.PrimaryScreen.WorkingArea;
-            px = wa.Right - 220 * S;
-            py = wa.Bottom;
+            bool onScreen = false;
+            if (pinned)
+                foreach (Screen sc in Screen.AllScreens)
+                    if (sc.WorkingArea.Contains((int)px, (int)pinY - 10)) onScreen = true;
+            if (onScreen) py = pinY;
+            else
+            {
+                pinned = false;
+                px = wa.Right - 220 * S;
+                py = wa.Bottom;
+            }
             target = px;
 
             menu = BuildMenu();
@@ -265,6 +276,12 @@ namespace ClawdDesktop
                 double hours = Math.Min(48, Math.Max(0, (DateTime.UtcNow.Ticks - ticks) / (double)TimeSpan.TicksPerHour));
                 food = Clamp(f - (float)hours * 4, 5, 100);
                 mood = Clamp(m - (float)hours * 3, 5, 100);
+                if (p.Length >= 6 && p[3] == "1")
+                {
+                    pinned = true;
+                    px = float.Parse(p[4], CultureInfo.InvariantCulture);
+                    pinY = float.Parse(p[5], CultureInfo.InvariantCulture);
+                }
             }
             catch { }
         }
@@ -274,7 +291,7 @@ namespace ClawdDesktop
             try
             {
                 Directory.CreateDirectory(Path.GetDirectoryName(savePath));
-                File.WriteAllText(savePath, string.Format(CultureInfo.InvariantCulture, "{0:0.0},{1:0.0},{2}", food, mood, DateTime.UtcNow.Ticks));
+                File.WriteAllText(savePath, string.Format(CultureInfo.InvariantCulture, "{0:0.0},{1:0.0},{2},{3},{4:0},{5:0}", food, mood, DateTime.UtcNow.Ticks, pinned ? 1 : 0, px, pinY));
             }
             catch { }
         }
@@ -299,6 +316,7 @@ namespace ClawdDesktop
             AddItem(m, "摸摸头", PetHead);
             AddItem(m, "跳一下", Jump);
             sleepItem = AddItem(m, "睡觉", ToggleSleep);
+            pinItem = AddItem(m, "定在这里", TogglePin);
             m.Items.Add(new ToolStripSeparator());
             ToolStripMenuItem claude = AddItem(m, "打开 Claude", OpenClaude);
             claude.Font = new Font(claude.Font, FontStyle.Bold);
@@ -310,6 +328,7 @@ namespace ClawdDesktop
             {
                 statItem.Text = string.Format("Clawd · 饱腹 {0:0} · 心情 {1:0}", food, mood);
                 sleepItem.Text = state == "sleep" ? "叫醒它" : "睡觉";
+                pinItem.Checked = pinned;
                 autoItem.Checked = AutoStartOn();
                 autoItem.Enabled = !string.IsNullOrEmpty(launcherPath);
             };
@@ -333,9 +352,9 @@ namespace ClawdDesktop
             Touch();
             Rectangle wa = Area();
             CookieForm c = new CookieForm(Math.Max(2, (int)Math.Round(U * 0.6f)));
-            c.X = Clamp(px + R(-300, 300) * S, wa.Left + 40 * S, wa.Right - 40 * S);
+            c.X = pinned ? px : Clamp(px + R(-300, 300) * S, wa.Left + 40 * S, wa.Right - 40 * S);
             c.Y = wa.Top + 10;
-            c.Floor = wa.Bottom;
+            c.Floor = pinned ? py : wa.Bottom;
             c.Place();
             c.Show();
             cookies.Add(c);
@@ -361,6 +380,21 @@ namespace ClawdDesktop
             Say("晚安…", 1.5f);
         }
 
+        void TogglePin()
+        {
+            Touch();
+            if (InAir()) return;
+            pinned = !pinned;
+            if (pinned)
+            {
+                pinY = py;
+                if (state == "walk") SetState("idle", 2);
+                Say("好，我就待在这儿！拖我可以换地方", 3f);
+            }
+            else Say("自由啦～", 2f);
+            SaveState();
+        }
+
         void OpenClaude()
         {
             Touch();
@@ -373,6 +407,7 @@ namespace ClawdDesktop
         {
             Touch();
             Rectangle wa = Screen.PrimaryScreen.WorkingArea;
+            pinned = false;
             px = wa.Right - 220 * S;
             py = wa.Top + 40 * S;
             vx = 0;
@@ -505,7 +540,7 @@ namespace ClawdDesktop
             if (nextBlink <= 0) { blink = 0.12f; nextBlink = R(2, 5); }
 
             Rectangle wa = Area();
-            float floor = wa.Bottom;
+            float floor = pinned ? pinY : wa.Bottom;
             float minX = wa.Left + 50 * S, maxX = wa.Right - 50 * S;
 
             // 饼干下落
@@ -558,7 +593,7 @@ namespace ClawdDesktop
                     if (t > next)
                     {
                         if (idleFor > 180) { SetState("sleep", R(90, 240)); break; }
-                        if (rnd.NextDouble() < 0.5)
+                        if (!pinned && rnd.NextDouble() < 0.5)
                         {
                             target = Clamp(px + R(-350, 350) * S, minX, maxX);
                             SetState("walk", 0);
@@ -697,7 +732,15 @@ namespace ClawdDesktop
         {
             base.OnMouseUp(e);
             if (e.Button != MouseButtons.Left) return;
-            if (dragging)
+            if (dragging && pinned)
+            {
+                pinY = py;
+                squash = 0.12f;
+                SetState("idle", R(1, 2.5f));
+                Say("这里不错！", 1.6f);
+                SaveState();
+            }
+            else if (dragging)
             {
                 vx = Clamp(mvx, -1600 * S, 1600 * S);
                 vy = Clamp(mvy, -1400 * S, 1800 * S);
