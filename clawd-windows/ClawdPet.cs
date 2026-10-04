@@ -269,14 +269,17 @@ namespace ClawdDesktop
         static bool pomoHalfSaid, pomoFiveSaid;
         static readonly Random rnd = new Random();
         static int friendIndex;
+        static float zoom = 2f;   // 大小：1 小 / 1.5 中 / 2 大 / 3 超大
+        static readonly float[] Zooms = { 1f, 1.5f, 2f, 3f };
+        static readonly string[] ZoomNames = { "小", "中", "大", "超大" };
 
         readonly bool isMain;
         readonly string petName;
         readonly Color bodyC, legC;
 
         readonly float S;   // DPI 缩放
-        readonly int U;     // 一个像素格的大小
-        readonly int FW, FH;
+        int U;              // 一个像素格的大小（跟着 DPI 和大小设置变）
+        int FW, FH;
 
         float px, py, vx, vy;
         int dir = 1;
@@ -303,8 +306,10 @@ namespace ClawdDesktop
         readonly NotifyIcon tray;
         readonly ContextMenuStrip menu;
         ToolStripMenuItem statItem, sleepItem, autoItem, pinItem, chaseItem, ballItem, pomoItem, friendItem;
+        readonly List<ToolStripMenuItem> zoomItems = new List<ToolStripMenuItem>();
         readonly string launcherPath, savePath;
-        readonly Font bubbleFont, zFont, timerFont;
+        Font bubbleFont, timerFont;
+        readonly Font zFont;
 
         public PetForm(string launcher) : this(launcher, null) { }
 
@@ -322,24 +327,18 @@ namespace ClawdDesktop
             Text = "Clawd";
 
             using (Graphics g = CreateGraphics()) S = g.DpiX / 96f;
-            U = Math.Max(3, (int)Math.Round(5 * S));
-            FW = (int)(260 * S);
-            FH = (int)(200 * S);
-            Size = new Size(FW, FH);
-
-            bubbleFont = new Font("Microsoft YaHei UI", 9.5f);
             zFont = new Font("Consolas", 11f, FontStyle.Bold);
-            timerFont = new Font("Consolas", 8.5f, FontStyle.Bold);
 
             string dirPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "ClawdPet");
             savePath = Path.Combine(dirPath, "state.txt");
+            if (isMain) LoadState();
+            ApplyZoom();
 
             Rectangle wa = Screen.PrimaryScreen.WorkingArea;
             if (isMain)
             {
                 petName = "Clawd";
                 bodyC = ClawdOrange;
-                LoadState();
                 bool onScreen = false;
                 if (pinned)
                     foreach (Screen sc in Screen.AllScreens)
@@ -421,6 +420,33 @@ namespace ClawdDesktop
             return Screen.FromPoint(new Point((int)px, (int)py - 10)).WorkingArea;
         }
 
+        // 按当前大小重新算像素格、窗口和字体
+        void ApplyZoom()
+        {
+            U = Math.Max(3, (int)Math.Round(5 * S * zoom));
+            FW = (int)Math.Max(260 * S, 18 * U + 60 * S);
+            FH = 11 * U + (int)(130 * S);
+            Size = new Size(FW, FH);
+            float fs = Clamp(zoom * 0.75f, 1f, 1.7f);
+            if (bubbleFont != null) bubbleFont.Dispose();
+            if (timerFont != null) timerFont.Dispose();
+            bubbleFont = new Font("Microsoft YaHei UI", 9.5f * fs);
+            timerFont = new Font("Consolas", 8.5f * fs, FontStyle.Bold);
+        }
+
+        void SetZoom(float z)
+        {
+            zoom = z;
+            foreach (PetForm p in pets.ToArray())
+            {
+                p.ApplyZoom();
+                p.Place();
+                p.Invalidate();
+            }
+            Say(z >= 3 ? "我变大啦！！" : (z <= 1 ? "缩小～" : "这个大小刚刚好"), 2f);
+            foreach (PetForm p in pets) if (p.isMain) p.SaveState();
+        }
+
         void Place()
         {
             Location = new Point((int)Math.Round(px - FW / 2f), (int)Math.Round(py - FH + 2 * S));
@@ -463,6 +489,7 @@ namespace ClawdDesktop
                 double hours = Math.Min(48, Math.Max(0, (DateTime.UtcNow.Ticks - ticks) / (double)TimeSpan.TicksPerHour));
                 food = Clamp(f - (float)hours * 4, 5, 100);
                 mood = Clamp(m - (float)hours * 3, 5, 100);
+                if (p.Length >= 7) zoom = Clamp(float.Parse(p[6], CultureInfo.InvariantCulture), 1f, 3f);
                 if (p.Length >= 6 && p[3] == "1")
                 {
                     pinned = true;
@@ -479,7 +506,7 @@ namespace ClawdDesktop
             try
             {
                 Directory.CreateDirectory(Path.GetDirectoryName(savePath));
-                File.WriteAllText(savePath, string.Format(CultureInfo.InvariantCulture, "{0:0.0},{1:0.0},{2},{3},{4:0},{5:0}", food, mood, DateTime.UtcNow.Ticks, pinned ? 1 : 0, px, pinY));
+                File.WriteAllText(savePath, string.Format(CultureInfo.InvariantCulture, "{0:0.0},{1:0.0},{2},{3},{4:0},{5:0},{6:0.0}", food, mood, DateTime.UtcNow.Ticks, pinned ? 1 : 0, px, pinY, zoom));
             }
             catch { }
         }
@@ -514,6 +541,14 @@ namespace ClawdDesktop
             friendItem = AddItem(play.DropDownItems, "再来一只 Clawd", AddFriend);
             pomoItem = AddItem(m.Items, "番茄钟（25 分钟）", TogglePomodoro);
 
+            ToolStripMenuItem sizeMenu = new ToolStripMenuItem("大小");
+            m.Items.Add(sizeMenu);
+            for (int i = 0; i < Zooms.Length; i++)
+            {
+                float z = Zooms[i];
+                zoomItems.Add(AddItem(sizeMenu.DropDownItems, ZoomNames[i], delegate { SetZoom(z); }));
+            }
+
             m.Items.Add(new ToolStripSeparator());
             ToolStripMenuItem claude = AddItem(m.Items, "打开 Claude", OpenClaude);
             claude.Font = new Font(claude.Font, FontStyle.Bold);
@@ -532,6 +567,7 @@ namespace ClawdDesktop
                 sleepItem.Text = state == "sleep" ? "叫醒它" : "睡觉";
                 pinItem.Checked = pinned;
                 chaseItem.Checked = chaseMouse;
+                for (int i = 0; i < zoomItems.Count; i++) zoomItems[i].Checked = Math.Abs(Zooms[i] - zoom) < 0.01f;
                 ballItem.Text = ball != null ? "收起球" : "扔个球";
                 friendItem.Enabled = pets.Count < MaxPets;
                 if (PomoActive)
@@ -656,7 +692,7 @@ namespace ClawdDesktop
                 return;
             }
             Rectangle wa = Area();
-            ball = new BallForm(Math.Max(8, (int)Math.Round(9 * S)), S);
+            ball = new BallForm(Math.Max(8, (int)Math.Round(9 * S * Math.Max(1f, zoom * 0.8f))), S);
             ball.X = Clamp(px + R(-250, 250) * S, wa.Left + 40 * S, wa.Right - 40 * S);
             ball.Y = wa.Top + 40 * S;
             ball.Vx = R(-200, 200) * S;
